@@ -1,0 +1,5 @@
+# extra packages only for the Windows "Print dialog" mode (not needed on Streamlit Cloud)
+-r requirements.txt
+pyautogui
+opencv-python
+pillow
