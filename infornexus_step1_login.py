@@ -19,6 +19,7 @@ Result: nexus_session.json (cookies/storage) that later steps reuse
 so they don't have to log in again.
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -86,6 +87,49 @@ def login(page):
         raise RuntimeError(f"Login failed: {msg} (see debug_login_failed.png)")
 
     page.wait_for_load_state("networkidle", timeout=30_000)
+
+
+def find_reactivate_scope(page):
+    """Return (scope, button) when Nexus shows 'The session ... has timed out ... Re-Activate'."""
+    pattern = re.compile(r"^\s*re-?activate\s*$", re.I)
+    for scope in [page] + list(page.frames):
+        try:
+            for btn in (scope.get_by_role("button", name=pattern), scope.get_by_text(pattern)):
+                if btn.count() and btn.first.is_visible():
+                    return scope, btn.first
+        except Exception:
+            continue
+    return None, None
+
+
+def reactivate_if_needed(page, timeout=30_000):
+    """If the 'session timed out - Re-Activate' page is showing, enter the password (and the
+    access code, if any) and click Re-Activate. Returns True if it did, False if that page
+    was not shown. Raises RuntimeError if the re-activation does not work."""
+    scope, btn = find_reactivate_scope(page)
+    if scope is None:
+        return False
+    if not PASSWORD:
+        raise RuntimeError("Session timed out and NEXUS_PASS is empty - check the .env file")
+    print("Session timed out - re-activating...")
+    fields = scope.locator("input:visible:not([type='hidden']):not([type='submit']):not([type='button'])")
+    type_into(fields.nth(0), PASSWORD)                       # Password box
+    if ACCESS_CODE and fields.count() > 1:
+        type_into(fields.nth(1), ACCESS_CODE)                # Access Code box
+    page.screenshot(path="debug_reactivate_before_click.png")
+    btn.click()
+    try:
+        btn.wait_for(state="hidden", timeout=timeout)
+    except PWTimeout:
+        page.screenshot(path="debug_reactivate_failed.png", full_page=True)
+        raise RuntimeError("Re-activate failed (wrong password / access code?) - see debug_reactivate_failed.png")
+    page.wait_for_load_state("domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    except PWTimeout:
+        pass
+    print("Session re-activated:", page.url)
+    return True
 
 
 def main():

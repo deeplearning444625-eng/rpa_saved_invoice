@@ -1,16 +1,14 @@
-# secrets and login sessions - NEVER commit these
 .env
-.streamlit/secrets.toml
 secrets.toml
-nexus_session.json
-nexus_home.txt
-
-# run output
+.streamlit/secrets.toml
+nexus_session*
+nexus_home*
 uploads/
 output_pdfs/
-batch_results.csv
-robot_log.txt
 debug_*.png
-
+robot_log.txt
+dispatch_robot_log.txt
+dispatched_loop_log.csv
+batch_results.csv
 __pycache__/
 *.pyc

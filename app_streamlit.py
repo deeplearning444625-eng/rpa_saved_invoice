@@ -9,6 +9,7 @@ clicks Chrome's print dialog on that screen):
 
 Files needed in the same folder: infornexus_step1_login.py, infornexus_step2_menu.py,
 print_gui.py, .env (NEXUS_USER / NEXUS_PASS).
+For the Dispatch process (sidebar) also: dispatched_step.py, dispatched_loop.py.
 """
 import json
 import os
@@ -31,6 +32,9 @@ OUTPUT_DIR = BASE / "output_pdfs"
 LOG_FILE = BASE / "robot_log.txt"
 RESULTS_CSV = BASE / "batch_results.csv"
 SCRIPT = BASE / "infornexus_step2_menu.py"
+D_SCRIPT = BASE / "dispatched_loop.py"                 # Dispatch process (runs dispatched_step per invoice)
+D_LOG_FILE = BASE / "dispatch_robot_log.txt"
+D_RESULTS_CSV = BASE / "dispatched_loop_log.csv"       # written by dispatched_loop.py
 
 st.set_page_config(page_title="Nexus Invoice PDF Robot", page_icon="🧾", layout="wide")
 
@@ -129,15 +133,214 @@ def read_log():
     return LOG_FILE.read_text(encoding="utf-8", errors="replace")
 
 
+# ---------------------------------------------------------------- dispatch process
+def d_is_running():
+    p = st.session_state.get("dproc")
+    return p is not None and p.poll() is None
+
+
+def read_dispatch_plan(xlsx_path):
+    """{invoice: [PO numbers]} from the Excel, using dispatched_loop's own reader."""
+    sys.path.insert(0, str(BASE))
+    import importlib
+    mod = importlib.import_module("dispatched_loop")
+    try:
+        return mod.read_invoices(str(xlsx_path))
+    except SystemExit as e:                       # the reader exits with a message
+        raise ValueError(str(e))
+
+
+def d_log_status():
+    """{invoice: last status} from dispatched_loop_log.csv."""
+    status = {}
+    if D_RESULTS_CSV.exists():
+        try:
+            df = pd.read_csv(D_RESULTS_CSV, dtype=str, keep_default_na=False)
+            for inv, st_ in zip(df["invoice"], df["status"]):
+                status[inv] = st_
+        except Exception:
+            pass
+    return status
+
+
+def d_read_log():
+    if not D_LOG_FILE.exists():
+        return ""
+    return D_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+
+
+def start_dispatch(xlsx_path, invoices, opts):
+    env = os.environ.copy()
+    env.update({
+        "NONINTERACTIVE": "1",                    # never wait for 'Press Enter'
+        "HEADLESS": "true" if opts["headless"] else "false",
+        "MAX_ATTEMPTS": str(opts["max_attempts"]),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    cmd = [sys.executable, "-u", str(D_SCRIPT), str(xlsx_path), "--only", ",".join(invoices)]
+    if opts["redo"]:
+        cmd.append("--redo")
+    log = open(D_LOG_FILE, "w", encoding="utf-8")
+    st.session_state["dproc"] = subprocess.Popen(
+        cmd, cwd=str(BASE), env=env, stdout=log, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=not IS_WINDOWS,         # lets Stop kill the browser too (Linux)
+    )
+    st.session_state["d_started"] = time.time()
+    st.session_state["d_started_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["d_total"] = len(invoices)
+
+
+def dispatch_page():
+    busy = d_is_running()
+    other_busy = is_running()                     # the PDF robot
+    left, right = st.columns([1, 1.4], gap="large")
+
+    # ---------- left: upload + options
+    with left:
+        st.subheader("1 · Upload Excel")
+        up = st.file_uploader("Excel with INV.NO. and PO Number columns", type=["xlsx", "xlsm"],
+                              key="d_upload", disabled=busy or other_busy)
+        plan, saved_path = {}, None
+        if up is not None:
+            key = f"{up.name}-{up.size}"
+            if st.session_state.get("d_up_key") != key:      # read the file only once, not on every refresh
+                UPLOAD_DIR.mkdir(exist_ok=True)
+                saved = UPLOAD_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{up.name}"
+                saved.write_bytes(up.getbuffer())
+                try:
+                    st.session_state["d_plan"] = read_dispatch_plan(saved)
+                    st.session_state["d_error"] = None
+                except Exception as e:
+                    st.session_state["d_plan"] = {}
+                    st.session_state["d_error"] = str(e)
+                st.session_state["d_path"] = str(saved)
+                st.session_state["d_up_key"] = key
+            plan = st.session_state.get("d_plan", {})
+            saved_path = st.session_state.get("d_path")
+            if st.session_state.get("d_error"):
+                st.error(f"Could not read the file: {st.session_state['d_error']}")
+            elif plan:
+                st.success(f"{len(plan)} invoices found - the first PO of each invoice is searched")
+        else:
+            st.session_state.pop("d_up_key", None)
+
+        status = d_log_status()
+        chosen = []
+        if plan:
+            st.dataframe(pd.DataFrame({
+                "invoice": list(plan),
+                "PO to search": [p[0] for p in plan.values()],
+                "POs in invoice": [len(p) for p in plan.values()],
+                "last status": [status.get(i, "") for i in plan]}),
+                hide_index=True, use_container_width=True)
+            chosen = st.multiselect("Invoices to run", list(plan), default=list(plan), disabled=busy)
+
+        st.subheader("2 · Options")
+        skip_done = st.checkbox("Skip invoices already DONE / UNCERTAIN / SKIPPED in the log", value=True, disabled=busy)
+        max_attempts = st.number_input("Attempts per invoice (rebuild on error)", 1, 10, 3, 1, disabled=busy)
+        with st.expander("More"):
+            headless = st.checkbox("Headless browser", value=False, disabled=busy)
+            if not IS_WINDOWS:
+                headless = True                   # a server has no screen
+
+        to_run = [i for i in chosen if not (skip_done and status.get(i) in ("DONE", "UNCERTAIN", "SKIPPED"))]
+
+        st.subheader("3 · Run")
+        st.warning("This robot **approves and signs** dispatches in Infor Nexus. Try one invoice first.")
+        if chosen and not to_run:
+            st.info("Every selected invoice is already DONE / UNCERTAIN / SKIPPED in the log. "
+                    "Untick the skip option to run them again.")
+        confirmed = st.checkbox("I understand the dispatches of the selected invoices will be approved and signed",
+                                value=False, disabled=busy)
+        if other_busy:
+            st.caption("The Invoice PDF robot is running - wait for it to finish.")
+        c1, c2 = st.columns(2)
+        if c1.button("▶ Start dispatch", type="primary", key="d_start", use_container_width=True,
+                     disabled=busy or other_busy or not to_run or not confirmed or not saved_path):
+            start_dispatch(saved_path, chosen, dict(redo=not skip_done, headless=headless,
+                                                    max_attempts=int(max_attempts)))
+            st.rerun()
+        if c2.button("■ Stop", key="d_stop", disabled=not busy, use_container_width=True):
+            kill_robot(st.session_state["dproc"])
+            time.sleep(1)
+            st.rerun()
+
+    # ---------- right: progress, results
+    with right:
+        st.subheader("Progress")
+        log = d_read_log()
+        cur = None
+        for m in re.finditer(r"\[(\d+)/(\d+)\] Invoice (\S+) \|", log):
+            cur = m
+        if cur:
+            n, total, inv = int(cur.group(1)), int(cur.group(2)), cur.group(3)
+            done_n = n - 1 if busy else n
+            st.progress(min(done_n / total, 1.0) if total else 0.0,
+                        text=f"{'Working on' if busy else 'Last'}: {inv}  ({n}/{total})")
+        if busy:
+            st.info("🟢 Dispatch robot is running…")
+        elif st.session_state.get("dproc") is not None:
+            code = st.session_state["dproc"].returncode
+            (st.success if code == 0 else st.error)(
+                "Finished" if code == 0 else f"Finished with problems or stopped (exit code {code}) - see Results and the log")
+
+        with st.expander("Live log", expanded=busy):
+            st.code("\n".join(log.splitlines()[-40:]) or "(no log yet)", language="text")
+
+        if D_RESULTS_CSV.exists():
+            try:
+                rdf = pd.read_csv(D_RESULTS_CSV, dtype=str, keep_default_na=False)
+            except Exception:
+                rdf = pd.DataFrame()
+            if not rdf.empty:
+                started = st.session_state.get("d_started_str")
+                st.subheader("Results (this run)")
+                this = rdf[rdf["time"] >= started] if started else rdf.iloc[0:0]
+                if this.empty:
+                    st.caption("No result yet in this run.")
+                else:
+                    st.dataframe(this.iloc[::-1], use_container_width=True, hide_index=True)
+                with st.expander("Full log of all runs"):
+                    st.dataframe(rdf.iloc[::-1], use_container_width=True, hide_index=True)
+                st.caption("DONE = signed. SKIPPED = already approved in Nexus, nothing done. "
+                           "UNCERTAIN = Ok was clicked but not confirmed: check that dispatch in Nexus. "
+                           "FAILED = nothing was signed (it is tried again next run).")
+
+        shots = sorted(BASE.glob("debug_dispatched_failed*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if shots and shots[0].stat().st_mtime >= st.session_state.get("d_started", float("inf")):
+            with st.expander("Last failure screenshot"):
+                st.image(str(shots[0]))
+
+    if d_is_running():                            # auto-refresh while the robot is running
+        time.sleep(1.5)
+        st.rerun()
+
+
 # ---------------------------------------------------------------- page
-st.title("🧾 Nexus Invoice PDF Robot")
-st.caption("Upload the Excel list → the robot opens each invoice in Infor Nexus and saves "
-           "`<invoice>-INV.pdf` into `output_pdfs`.")
+MODE_PDF, MODE_DISPATCH = "🧾 Invoice PDF", "🚚 Dispatch (validate + approve)"
+mode = st.radio("Process", [MODE_PDF, MODE_DISPATCH], horizontal=True, label_visibility="collapsed")
+if mode == MODE_DISPATCH:
+    st.title("🚚 Nexus Dispatch Robot")
+    st.caption("Upload the Excel (INV.NO. + PO Number) → for each invoice the robot searches one PO in "
+               "Infor Nexus Dispatches, fills the invoice number, then Preview → Validate → Approve → Ok.")
+else:
+    st.title("🧾 Nexus Invoice PDF Robot")
+    st.caption("Upload the Excel list → the robot opens each invoice in Infor Nexus and saves "
+               "`<invoice>-INV.pdf` into `output_pdfs`.")
 
 env_vals = dotenv_values(BASE / ".env")
 if not ((env_vals.get("NEXUS_USER") or os.getenv("NEXUS_USER"))
         and (env_vals.get("NEXUS_PASS") or os.getenv("NEXUS_PASS"))):
     st.error("NEXUS_USER / NEXUS_PASS are missing (`.env` next to this app, or Secrets on Streamlit Cloud).")
+
+if mode == MODE_DISPATCH:
+    dispatch_page()
+    st.stop()
+if d_is_running():
+    st.warning("🚚 The Dispatch robot is running - Start is disabled here until it finishes "
+               "(both robots share the same Nexus session).")
 
 left, right = st.columns([1, 1.4], gap="large")
 
@@ -215,7 +418,7 @@ with left:
         st.warning("While it runs the robot browser takes over the screen. "
                    "**Don't touch the mouse or keyboard** until it finishes.")
     c1, c2 = st.columns(2)
-    if c1.button("▶ Start", type="primary", disabled=is_running() or not chosen, use_container_width=True):
+    if c1.button("▶ Start", type="primary", disabled=is_running() or d_is_running() or not chosen, use_container_width=True):
         start_robot(chosen, opts)
         st.rerun()
     if c2.button("■ Stop", disabled=not is_running(), use_container_width=True):

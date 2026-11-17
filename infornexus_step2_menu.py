@@ -393,26 +393,36 @@ def step_3_2_gui_print(page, invoice_no):
 def is_logged_in(page, timeout=15_000, grace=8_000):
     """True once the top menu is visible.
 
-    The login form can flash for a moment while the site checks the session and
-    redirects, so seeing the form is not enough: only give up if it stays on
-    screen for `grace` ms (or nothing shows up within `timeout` ms).
+    - The login form can flash for a moment while the site checks the session, so only give
+      up if it stays on screen for `grace` ms (or nothing shows up within `timeout` ms).
+    - If Nexus shows 'session timed out - Re-Activate', it is re-activated with the password
+      (once) and we keep waiting for the menu.
     """
+    from infornexus_step1_login import reactivate_if_needed
     menu = page.get_by_text(re.compile(r"^\s*applications\s*$", re.I)).first
     form = page.get_by_placeholder("Password").first
     t0 = time.time()
     form_since = None
+    reactivated = False
     while (time.time() - t0) * 1000 < timeout:
         try:
-            if menu.is_visible():
-                return True
-            if form.is_visible():
-                form_since = form_since or time.time()
-                if (time.time() - form_since) * 1000 > grace:
-                    return False
-            else:
-                form_since = None
+            menu_visible = menu.is_visible()
+            form_visible = form.is_visible()
         except Exception:
-            pass
+            menu_visible = form_visible = False
+        if menu_visible:
+            return True
+        if not reactivated and reactivate_if_needed(page):
+            reactivated = True
+            form_since = None
+            t0 = time.time()                       # fresh wait for the menu after re-activating
+            continue
+        if form_visible:
+            form_since = form_since or time.time()
+            if (time.time() - form_since) * 1000 > grace:
+                return False
+        else:
+            form_since = None
         page.wait_for_timeout(500)
     return False
 
@@ -650,6 +660,7 @@ def main():
                 sys.exit("Logged in but top menu not found - see debug_step2_nomenu.png")
             context.storage_state(path=str(SESSION_FILE))
         remember_home(page)
+        context.storage_state(path=str(SESSION_FILE))   # keep the saved cookies fresh
 
         failures_in_a_row = 0
         for n, inv in enumerate(invoices, start=1):
